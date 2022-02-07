@@ -23,22 +23,9 @@ from deep_sort import preprocessing, nn_matching
 from deep_sort.detection import Detection
 from deep_sort.tracker import Tracker
 from tools import generate_detections as gdet
-flags.DEFINE_string('framework', 'tf', '(tf, tflite, trt')
-flags.DEFINE_string('weights', './checkpoints/yolov4-416',
-                    'path to weights file')
-flags.DEFINE_integer('size', 416, 'resize images to')
-flags.DEFINE_boolean('tiny', False, 'yolo or yolo-tiny')
-flags.DEFINE_string('model', 'yolov4', 'yolov3 or yolov4')
-flags.DEFINE_string('video', './data/video/test.mp4', 'path to input video or set to 0 for webcam')
-flags.DEFINE_string('output', None, 'path to output video')
-flags.DEFINE_string('output_format', 'XVID', 'codec used in VideoWriter when saving video to file')
-flags.DEFINE_float('iou', 0.45, 'iou threshold')
-flags.DEFINE_float('score', 0.50, 'score threshold')
-flags.DEFINE_boolean('dont_show', False, 'dont show video output')
-flags.DEFINE_boolean('info', False, 'show detailed info of tracked objects')
-flags.DEFINE_boolean('count', False, 'count objects being tracked on screen')
 
-def main(_argv):
+def object_tracker(framework = 'tf', weights = './checkpoints/yolov4-416', size = 416, tiny = False, model = 'yolov4', video = './data/video/test.mp4', output = None, 
+output_format = 'XVID', iou = 0.45, score = 0.50, dont_show = True, info = False, count = False):
     # Definition of the parameters
     max_cosine_distance = 0.4
     nn_budget = None
@@ -56,13 +43,20 @@ def main(_argv):
     config = ConfigProto()
     config.gpu_options.allow_growth = True
     session = InteractiveSession(config=config)
-    STRIDES, ANCHORS, NUM_CLASS, XYSCALE = utils.load_config(FLAGS)
-    input_size = FLAGS.size
-    video_path = FLAGS.video
+    #STRIDES, ANCHORS, NUM_CLASS, XYSCALE = utils.load_config(FLAGS)
+    STRIDES = np.array(cfg.YOLO.STRIDES)
+    if model == 'yolov4':
+        ANCHORS = utils.get_anchors(cfg.YOLO.ANCHORS, tiny)
+    elif model == 'yolov3':
+        ANCHORS = utils.get_anchors(cfg.YOLO.ANCHORS_V3, tiny)
+    XYSCALE = cfg.YOLO.XYSCALE if model == 'yolov4' else [1, 1, 1]
+    NUM_CLASS = len(utils.read_class_names(cfg.YOLO.CLASSES))
+    input_size = size
+    video_path = video
 
     # load tflite model if flag is set
-    if FLAGS.framework == 'tflite':
-        interpreter = tf.lite.Interpreter(model_path=FLAGS.weights)
+    if framework == 'tflite':
+        interpreter = tf.lite.Interpreter(model_path=weights)
         interpreter.allocate_tensors()
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
@@ -70,7 +64,7 @@ def main(_argv):
         print(output_details)
     # otherwise load standard tensorflow saved model
     else:
-        saved_model_loaded = tf.saved_model.load(FLAGS.weights, tags=[tag_constants.SERVING])
+        saved_model_loaded = tf.saved_model.load(weights, tags=[tag_constants.SERVING])
         infer = saved_model_loaded.signatures['serving_default']
 
     # begin video capture
@@ -82,15 +76,21 @@ def main(_argv):
     out = None
 
     # get video ready to save locally if flag is set
-    if FLAGS.output:
+    if output:
         # by default VideoCapture returns float instead of int
         width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(vid.get(cv2.CAP_PROP_FPS))
-        codec = cv2.VideoWriter_fourcc(*FLAGS.output_format)
-        out = cv2.VideoWriter(FLAGS.output, codec, fps, (width, height))
+        codec = cv2.VideoWriter_fourcc(*output_format)
+        out = cv2.VideoWriter(output, codec, fps, (width, height))
 
     frame_num = 0
+
+    allowed_classes = ['person', 'car', 'truck']
+    classes_count_dict = {}
+    classes_id_list = []
+    for classes in allowed_classes:
+      classes_count_dict[classes] = 0
     # while video is running
     while True:
         return_value, frame = vid.read()
@@ -99,22 +99,26 @@ def main(_argv):
             image = Image.fromarray(frame)
         else:
             print('Video has ended or failed, try a different video format!')
+            return classes_count_dict
             break
         frame_num +=1
         print('Frame #: ', frame_num)
         frame_size = frame.shape[:2]
+        resize_ratio_x = frame_size[1]/input_size
+        resize_ratio_y = frame_size[0]/input_size
         image_data = cv2.resize(frame, (input_size, input_size))
         image_data = image_data / 255.
         image_data = image_data[np.newaxis, ...].astype(np.float32)
         start_time = time.time()
-
+        bottom_line = ((int(frame_size[1]*0.4), int(frame_size[1]*0.7)), (int(frame_size[0]*0.5), frame_size[0]))
+        cv2.rectangle(frame, (bottom_line[0][0], bottom_line[1][0]), (bottom_line[0][1], bottom_line[1][1]), (0,255,0), 2)
         # run detections on tflite if flag is set
-        if FLAGS.framework == 'tflite':
+        if framework == 'tflite':
             interpreter.set_tensor(input_details[0]['index'], image_data)
             interpreter.invoke()
             pred = [interpreter.get_tensor(output_details[i]['index']) for i in range(len(output_details))]
             # run detections using yolov3 if flag is set
-            if FLAGS.model == 'yolov3' and FLAGS.tiny == True:
+            if model == 'yolov3' and tiny == True:
                 boxes, pred_conf = filter_boxes(pred[1], pred[0], score_threshold=0.25,
                                                 input_shape=tf.constant([input_size, input_size]))
             else:
@@ -133,8 +137,8 @@ def main(_argv):
                 pred_conf, (tf.shape(pred_conf)[0], -1, tf.shape(pred_conf)[-1])),
             max_output_size_per_class=50,
             max_total_size=50,
-            iou_threshold=FLAGS.iou,
-            score_threshold=FLAGS.score
+            iou_threshold=iou,
+            score_threshold=score
         )
 
         # convert data to numpy arrays and slice out unused elements
@@ -174,7 +178,7 @@ def main(_argv):
                 names.append(class_name)
         names = np.array(names)
         count = len(names)
-        if FLAGS.count:
+        if count:
             cv2.putText(frame, "Objects being tracked: {}".format(count), (5, 35), cv2.FONT_HERSHEY_COMPLEX_SMALL, 2, (0, 255, 0), 2)
             print("Objects being tracked: {}".format(count))
         # delete detections that are not in allowed_classes
@@ -200,6 +204,7 @@ def main(_argv):
         tracker.predict()
         tracker.update(detections)
 
+        breaking_point = False
         # update tracks
         for track in tracker.tracks:
             if not track.is_confirmed() or track.time_since_update > 1:
@@ -210,13 +215,23 @@ def main(_argv):
         # draw bbox on screen
             color = colors[int(track.track_id) % len(colors)]
             color = [i * 255 for i in color]
-            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
-            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
-            cv2.putText(frame, class_name + "-" + str(track.track_id),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
-
+            xmin, ymin, xmax, ymax = bbox
+            bottom_frame = [bottom_line[0][0], bottom_line[1][0], bottom_line[0][1], bottom_line[1][1]]
+            if xmin > bottom_frame[0] and ymin > bottom_frame[1] and xmax < bottom_frame[2] and ymax < bottom_frame[3]:
+              # breaking_point = True
+              if track.track_id not in classes_id_list:
+                classes_count_dict[class_name] += 1
+                classes_id_list.append(track.track_id)
+              else:
+                pass
+              cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+              cv2.rectangle(frame, (int(bbox[0]), int(bbox[1]-30)), (int(bbox[0])+(len(class_name)+len(str(track.track_id)))*17, int(bbox[1])), color, -1)
+              cv2.putText(frame, class_name + "-" + str(classes_count_dict[class_name]),(int(bbox[0]), int(bbox[1]-10)),0, 0.75, (255,255,255),2)
         # if enable info flag then print details about each track
-            if FLAGS.info:
+            if info:
                 print("Tracker ID: {}, Class: {},  BBox Coords (xmin, ymin, xmax, ymax): {}".format(str(track.track_id), class_name, (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))))
+        if breaking_point:
+          break 
 
         # calculate frames per second of running detections
         fps = 1.0 / (time.time() - start_time)
@@ -224,17 +239,11 @@ def main(_argv):
         result = np.asarray(frame)
         result = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
-        if not FLAGS.dont_show:
+        if not dont_show:
             cv2.imshow("Output Video", result)
         
         # if output flag is set, save video file
-        if FLAGS.output:
+        if output:
             out.write(result)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
     cv2.destroyAllWindows()
-
-if __name__ == '__main__':
-    try:
-        app.run(main)
-    except SystemExit:
-        pass
